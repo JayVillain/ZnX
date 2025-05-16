@@ -1,0 +1,5 @@
+[+] URL: https://answers.illinois.edu/ischool/page.php?id=129348
+[+] DBMS: unknown
+[+] Injection: boolean
+[+] username: None
+[+] password: None

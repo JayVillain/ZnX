@@ -1,0 +1,5 @@
+[+] URL: https://kb.wisc.edu/wiscweb/page.php?id=69225
+[+] DBMS: unknown
+[+] Injection: boolean
+[+] username: None
+[+] password: None

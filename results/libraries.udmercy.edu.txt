@@ -1,0 +1,5 @@
+[+] URL: https://libraries.udmercy.edu/page.php?item_id=570
+[+] DBMS: unknown
+[+] Injection: boolean
+[+] username: None
+[+] password: None

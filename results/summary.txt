@@ -1,0 +1,23 @@
+[+] URL: https://answers.illinois.edu/ischool/page.php?id=129348
+[+] DBMS: unknown
+[+] Injection: boolean
+[+] username: None
+[+] password: None
+
+[+] URL: https://kb.ndsu.edu/it/page.php?id=98971
+[+] DBMS: unknown
+[+] Injection: boolean
+[+] username: None
+[+] password: None
+
+[+] URL: https://libraries.udmercy.edu/page.php?item_id=570
+[+] DBMS: unknown
+[+] Injection: boolean
+[+] username: None
+[+] password: None
+
+[+] URL: https://kb.wisc.edu/wiscweb/page.php?id=69225
+[+] DBMS: unknown
+[+] Injection: boolean
+[+] username: None
+[+] password: None

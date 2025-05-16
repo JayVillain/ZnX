@@ -1,0 +1,5 @@
+[+] URL: https://kb.ndsu.edu/it/page.php?id=98971
+[+] DBMS: unknown
+[+] Injection: boolean
+[+] username: None
+[+] password: None
